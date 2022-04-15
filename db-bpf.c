@@ -301,41 +301,62 @@ void *subtask(void *args) {
     clock_gettime(CLOCK_REALTIME, &now);
     size_t gap = 1000000000 / req_per_sec;
     deadline = now;
+    int ret;
+
+    // Submit a batch of requests
+    for (int i = 0; i < QUEUE_DEPTH; ++i) {
+        // Do not rate limit for the first batch
+        key__t key = rand() % max_key;
+        val__t val;
+        req_arr[r->issued] = init_request(key, r);
+        traverse(encode(0), req_arr[r->issued++]);
+        add_nano_to_timespec(&deadline, gap);
+    }
+    write_barrier();
+    ret = io_uring_enter(r->local_ring.ring_fd, QUEUE_DEPTH, 0, IORING_ENTER_GETEVENTS);
+    BUG_ON(ret != QUEUE_DEPTH);
 
     while (r->issued < r->op_count) {
-        // Submit a batch of requests
-        size_t num_req_submitted = 0;
-        while (!early_than(&now, &deadline) && (r->issued < r->op_count) && (r->issued - r->finished < QUEUE_DEPTH)) {
-            // Running late. Submit one request.
+        int reaped = poll_from_cq(&r->local_ring);
+        while (reaped == 0 && r->issued - r->finished == QUEUE_DEPTH) {
+            // Not busy polling
+            ret = io_uring_enter(s->ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
+            BUG_ON(ret != 0);
+            reaped = poll_from_cq(&r->local_ring);
+        }
+        for (int i = 0; i < reaped; ++i) {
+            traverse_complete(&r->local_ring, i);
+        }
+        int submitted = 0;
+        clock_gettime(CLOCK_REALTIME, &now);
+        while (r->issued - r->finished < QUEUE_DEPTH && !early_than(&now, &deadline)) {
             key__t key = rand() % max_key;
             val__t val;
-
             req_arr[r->issued] = init_request(key, r);
             traverse(encode(0), req_arr[r->issued++]);
-            ++num_req_submitted;
-
-            // Update timer
-            clock_gettime(CLOCK_REALTIME, &now);
             add_nano_to_timespec(&deadline, gap);
+            submitted++;
         }
-        if (num_req_submitted > 0) {
-            int ret;
-            ret = io_uring_enter(r->local_ring.ring_fd, num_req_submitted, 0, IORING_ENTER_GETEVENTS);
-            BUG_ON(ret != num_req_submitted);
+        if (submitted != 0) {
+            write_barrier();
+            ret = io_uring_enter(s->ring_fd, submitted, 0, IORING_ENTER_GETEVENTS);
+            BUG_ON(ret != submitted);
         }
-        while (r->issued - r->finished >= QUEUE_DEPTH / 2) {
-            traverse_complete(&r->local_ring);
-        }
-
         clock_gettime(CLOCK_REALTIME, &now);
-        if (early_than(&now, &deadline)) {
+        if (r->issued == r->finished && early_than(&now, &deadline)) {
             pthread_mutex_lock(&mutex);
             pthread_cond_timedwait(&cond, &mutex, &deadline);
             pthread_mutex_unlock(&mutex);
         }
     }
+    int remaining = r->issued - r->finished;
+    ret = io_uring_enter(s->ring_fd, 0, remaining, IORING_ENTER_GETEVENTS);
+    BUG_ON(ret != 0);
     while (r->finished < r->op_count) {
-        traverse_complete(&r->local_ring);
+        int reaped = poll_from_cq(&r->local_ring);
+        for (int i = 0; i < reaped; ++i) {
+            traverse_complete(&r->local_ring, i);
+        }
     }
     pthread_cond_destroy(&cond);
     pthread_mutex_destroy(&mutex);
@@ -425,60 +446,29 @@ void traverse(ptr__t ptr, Request *req) {
     sgq->n_keys = 1;
 
     submit_to_sq(s, (unsigned long long) req, vec, decode(ptr),
-                 req->scratch_buffer, bpf_fd, true);
+                 req->scratch_buffer, bpf_fd, false);
 }
 
-void traverse_complete(struct submitter *s) {
-    if ((*(s->cq_ring.head)) == (*(s->cq_ring.tail))) {
-        int ret;
-        ret = io_uring_enter(s->ring_fd, /* to_submit */ 0, /* min_complete */ 1, IORING_ENTER_GETEVENTS);
-        BUG_ON(ret != 0);
-    }
-
-    // poll_from_cq is changed to reap at most 1 completion
-    int reaped = poll_from_cq(s);
-    BUG_ON(reaped != 1);
-
-    Request *req = (Request *) s->completion_arr[0];
+void traverse_complete(struct submitter *s, int index) {
+    Request *req = (Request *) s->completion_arr[index];
     struct ScatterGatherQuery *sgq = (struct ScatterGatherQuery *) req->scratch_buffer;
-    // if (req->is_value) {
-        val__t val;
-        Log *log = (Log *)req->vec.iov_base;
-        memcpy(val, sgq->values[0].value, VAL_SIZE);
-        if (req->key != atoi(val)) {
-            printf("Errror! key: %lu val: %s\n", req->key, val);
-        }            
+    val__t val;
+    Log *log = (Log *)req->vec.iov_base;
+    memcpy(val, sgq->values[0].value, VAL_SIZE);
+    if (req->key != atoi(val)) {
+        printf("Errror! key: %lu val: %s\n", req->key, val);
+    }            
 
-        struct timespec end;
-        clock_gettime(CLOCK_REALTIME, &end);
-        size_t latency = 1000000000 * (end.tv_sec - req->start.tv_sec) + (end.tv_nsec - req->start.tv_nsec);
+    struct timespec end;
+    clock_gettime(CLOCK_REALTIME, &end);
+    size_t latency = 1000000000 * (end.tv_sec - req->start.tv_sec) + (end.tv_nsec - req->start.tv_nsec);
 
-        // __atomic_fetch_add(req->counter, 1, __ATOMIC_SEQ_CST);
-        // __atomic_fetch_add(req->timer, latency, __ATOMIC_SEQ_CST);
-        req->warg->histogram[req->warg->finished] = latency;
-        req->warg->finished++;
-        req->warg->timer += latency;
-        free(req->scratch_buffer);
-        free(log);
-        free(req);
-        // printf("thread %lu start %ld offset %ld end %ld latency %ld us\n", 
-        //         req->thread,
-        //         1000000 * req->start.tv_sec + req->start.tv_nsec,
-        //         1000000 * (req->start.tv_sec - start_tv.tv_sec) + (req->start.tv_nsec - start_tv.tv_nsec),
-        //         1000000 * end.tv_sec + end.tv_nsec,
-        //         latency);
-
-    // } else {
-    //     Node *node = (Node *)req->vec.iov_base;
-    //     ptr__t ptr = next_node(req->key, node);
-    //     if (node->type == LEAF) {
-    //         req->is_value = true;
-    //         ptr__t mask = BLK_SIZE - 1;
-    //         req->ofs = ptr & mask;
-    //         ptr &= (~mask);
-    //     }
-    //     traverse(ptr, req);
-    // }
+    req->warg->histogram[req->warg->finished] = latency;
+    req->warg->finished++;
+    req->warg->timer += latency;
+    free(req->scratch_buffer);
+    free(log);
+    free(req);
 }
 
 void wait_for_completion(struct submitter *s, size_t *counter, size_t target) {

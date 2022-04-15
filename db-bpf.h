@@ -69,7 +69,7 @@ struct ScatterGatherQuery {
 #define LOAD_MODE 0
 #define RUN_MODE 1
 #define FILE_MASK ((ptr__t)1 << 63)
-#define QUEUE_DEPTH 256
+#define QUEUE_DEPTH 32
 
 size_t layer_cnt;
 size_t cache_layer = 3;
@@ -150,7 +150,7 @@ void pread_log(ptr__t ptr, Log *log, int db_handler);
 
 void traverse(ptr__t ptr, Request *req);
 
-void traverse_complete(struct submitter *s);
+void traverse_complete(struct submitter *s, int index);
 
 void wait_for_completion(struct submitter *s, size_t *counter, size_t target);
 
