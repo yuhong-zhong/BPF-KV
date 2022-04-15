@@ -329,7 +329,7 @@ void *subtask(void *args) {
         }
         int submitted = 0;
         clock_gettime(CLOCK_REALTIME, &now);
-        while (r->issued - r->finished < QUEUE_DEPTH && !early_than(&now, &deadline)) {
+        while (r->issued < r->op_count && r->issued - r->finished < QUEUE_DEPTH && !early_than(&now, &deadline)) {
             key__t key = rand() % max_key;
             val__t val;
             req_arr[r->issued] = init_request(key, r);
