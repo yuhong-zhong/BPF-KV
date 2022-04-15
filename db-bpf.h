@@ -7,6 +7,7 @@
 #include <time.h>
 #include <liburing.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include <linux/bpf.h>
 #include <linux/lirc.h>
