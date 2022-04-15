@@ -320,7 +320,7 @@ void *subtask(void *args) {
         int reaped = poll_from_cq(&r->local_ring);
         while (reaped == 0 && r->issued - r->finished == QUEUE_DEPTH) {
             // Not busy polling
-            ret = io_uring_enter(s->ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
+            ret = io_uring_enter(r->local_ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
             BUG_ON(ret != 0);
             reaped = poll_from_cq(&r->local_ring);
         }
@@ -339,7 +339,7 @@ void *subtask(void *args) {
         }
         if (submitted != 0) {
             write_barrier();
-            ret = io_uring_enter(s->ring_fd, submitted, 0, IORING_ENTER_GETEVENTS);
+            ret = io_uring_enter(r->local_ring.ring_fd, submitted, 0, IORING_ENTER_GETEVENTS);
             BUG_ON(ret != submitted);
         }
         clock_gettime(CLOCK_REALTIME, &now);
@@ -350,7 +350,7 @@ void *subtask(void *args) {
         }
     }
     int remaining = r->issued - r->finished;
-    ret = io_uring_enter(s->ring_fd, 0, remaining, IORING_ENTER_GETEVENTS);
+    ret = io_uring_enter(r->local_ring.ring_fd, 0, remaining, IORING_ENTER_GETEVENTS);
     BUG_ON(ret != 0);
     while (r->finished < r->op_count) {
         int reaped = poll_from_cq(&r->local_ring);
@@ -469,12 +469,6 @@ void traverse_complete(struct submitter *s, int index) {
     free(req->scratch_buffer);
     free(log);
     free(req);
-}
-
-void wait_for_completion(struct submitter *s, size_t *counter, size_t target) {
-    do {
-        traverse_complete(s);
-    } while (*counter != target);
 }
 
 void print_node(ptr__t ptr, Node *node) {

@@ -152,8 +152,6 @@ void traverse(ptr__t ptr, Request *req);
 
 void traverse_complete(struct submitter *s, int index);
 
-void wait_for_completion(struct submitter *s, size_t *counter, size_t target);
-
 void pwrite_node(ptr__t ptr, Node *node, int db_handler);
 
 void pwrite_log(ptr__t ptr, Log *log, int db_handler);
