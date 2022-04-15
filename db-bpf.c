@@ -371,7 +371,7 @@ void traverse(ptr__t ptr, Request *req) {
     sgq->n_keys = 1;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_xrp_read(sqe, fd, vec, 1, decode(ptr), req->scratch_buffer, bpf_fd);
+    io_uring_prep_read_xrp(sqe, fd, vec, 1, decode(ptr), req->scratch_buffer, bpf_fd);
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(ring);
 }
