@@ -6,6 +6,15 @@
 #include <pthread.h>
 #include <time.h>
 #include <liburing.h>
+#include <math.h>
+#include "uring.h"
+
+#include <linux/bpf.h>
+#include <linux/lirc.h>
+#include <linux/input.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <fcntl.h>
 
 // Data-level information
 typedef unsigned long meta__t;
@@ -39,8 +48,25 @@ typedef struct _Log {
     val__t val[LOG_CAPACITY];
 } Log;
 
+#define SG_KEYS 32
+
+struct MaybeValue {
+    char found;
+    val__t value;
+};
+
+struct ScatterGatherQuery {
+    ptr__t root_pointer;
+    ptr__t value_ptr;
+    unsigned int state_flags;
+    int current_index;
+    int n_keys;
+    key__t keys[SG_KEYS];
+    struct MaybeValue values[SG_KEYS];
+};
+
 // Database-level information
-#define DB_PATH "/dev/treenvme0"
+#define DB_PATH "/dev/nvme0n1"
 #define LOAD_MODE 0
 #define RUN_MODE 1
 #define FILE_MASK ((ptr__t)1 << 63)
@@ -61,6 +87,7 @@ size_t read_ratio;
 size_t rmw_ratio;
 size_t req_per_sec;
 struct io_uring global_ring;
+int bpf_fd;
 
 typedef struct {
     size_t op_count;
@@ -77,6 +104,7 @@ typedef struct {
     key__t key;
     ptr__t ofs;
     struct iovec vec;
+    uint8_t *scratch_buffer;
     bool is_value;
     struct timespec start;
     WorkerArg *warg;
@@ -110,39 +138,21 @@ void build_cache(size_t layer_num);
 
 void *print_status(void *args);
 
-int get(key__t key, val__t val, WorkerArg *r);
-
-void update(key__t key, val__t val, int db_handler);
-
-void read_modify_write(key__t key, val__t val, int db_handler);
-
 ptr__t next_node(key__t key, Node *node);
 
 Request *init_request(key__t key, WorkerArg *warg);
 
-void read_node(ptr__t ptr, Node *node, int db_handler, struct io_uring *ring);
+void pread_node(ptr__t ptr, Node *node, int db_handler);
 
-void read_log(ptr__t ptr, Log *log, int db_handler, struct io_uring *ring);
-
-void read_complete(struct io_uring *ring, int is_node);
+void pread_log(ptr__t ptr, Log *log, int db_handler);
 
 void traverse(ptr__t ptr, Request *req);
 
 void traverse_complete(struct io_uring *ring);
 
-void wait_for_completion(struct io_uring *ring, size_t *counter, size_t target);
+void pwrite_node(ptr__t ptr, Node *node, int db_handler);
 
-void write_node(ptr__t ptr, Node *node, int db_handler, struct io_uring *ring);
-
-void write_log(ptr__t ptr, Log *log, int db_handler, struct io_uring *ring);
-
-void write_complete(struct io_uring *ring);
-
-int retrieve_value(ptr__t ptr, val__t val, WorkerArg *r);
-
-void update_value(ptr__t ptr, val__t val, int db_handler);
-
-void read_modify_write_value(ptr__t ptr, val__t val, int db_handler);
+void pwrite_log(ptr__t ptr, Log *log, int db_handler);
 
 int prompt_help();
 
@@ -157,5 +167,9 @@ void terminate_workers(pthread_t *tids, WorkerArg *args);
 int terminate();
 
 void print_node(ptr__t ptr, Node *node);
+
+int bpf(int cmd, union bpf_attr *attr, unsigned int size);
+
+int load_bpf_program(char *path);
 
 #endif

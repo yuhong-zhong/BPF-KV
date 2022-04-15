@@ -6,7 +6,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
-#include <linux/treenvme_ioctl.h>
+
 
 int get_handler(int flag) {
     int fd = open(DB_PATH, flag, 0644);
@@ -24,8 +24,7 @@ void initialize(size_t layer_num, int mode) {
         db = get_handler(O_RDWR|O_DIRECT);
     }
     io_uring_queue_init(QUEUE_DEPTH, &global_ring, 0);
-    
-    ioctl(db, TREENVME_IOCTL_IO_CMD);
+
     layer_cap = (size_t *)malloc(layer_num * sizeof(size_t));
     total_node = 1;
     layer_cap[0] = 1;
@@ -68,12 +67,10 @@ void build_cache(size_t layer_num) {
     }
 
     size_t head = 0, tail = 1;
-    read_node(encode(0), &cache[head], db, &global_ring);
-    read_complete(&global_ring, 1);
+    pread_node(encode(0), &cache[head], db);
     while (tail < entry_num) {
         for (size_t i = 0; i < cache[head].num; i++) {
-            read_node(cache[head].ptr[i], &cache[tail], db, &global_ring);
-            read_complete(&global_ring, 1);
+            pread_node(cache[head].ptr[i], &cache[tail], db);
             cache[head].ptr[i] = (ptr__t)(&cache[tail]); // in-memory cache entry has in-memory pointer
             tail++;
         }
@@ -121,10 +118,10 @@ int load(size_t layer_num) {
                               encode(total_node * BLK_SIZE + (next_pos - total_node) * VAL_SIZE);
                 next_pos++;
             }
-            write_node(encode(idx * BLK_SIZE), node, db, &global_ring);
-            write_complete(&global_ring);
+            pwrite_node(encode(idx * BLK_SIZE), node, db);
             start_key += extent;
             idx++;
+            free(node);
 
             // Sanity check
             // if (posix_memalign((void **)&tmp, 512, sizeof(Node))) {
@@ -151,9 +148,9 @@ int load(size_t layer_num) {
         for (size_t j = 0; j < LOG_CAPACITY; j++) {
             sprintf(log->val[j], "%63lu", i + j);
         }
-        write_log(encode(idx * BLK_SIZE), log, db, &global_ring);
-        write_complete(&global_ring);
+        pwrite_log(encode(idx * BLK_SIZE), log, db);
         idx++;
+        free(log);
 
         // Sanity check
         // if (posix_memalign((void **)&tmp, 512, sizeof(Log))) {
@@ -204,47 +201,44 @@ void terminate_workers(pthread_t *tids, WorkerArg *args) {
 }
 
 int cmp(const void *a, const void *b) {
-    long t = (long)(*(size_t *)a - *(size_t *)b);
-    if (t < 0) {
-        return -1;
-    } else if (t == 0){
+    size_t val_a = *((const size_t *) a);
+    size_t val_b = *((const size_t *) b);
+    if (val_a == val_b) {
         return 0;
+    } else if (val_a < val_b) {
+        return -1;
     } else {
         return 1;
     }
 }
 
+static double get_percentile(size_t *latency_arr, size_t request_num, double percentile)
+{
+    double exact_index = ((double) (request_num - 1)) * percentile;
+    double left_index = floor(exact_index);
+    double right_index = ceil(exact_index);
+
+    double left_value = (double) latency_arr[(size_t) left_index];
+    double right_value = (double) latency_arr[(size_t) right_index];
+    double value = left_value + (exact_index - left_index) * (right_value - left_value);
+    return value;
+}
+
 void print_tail_latency(WorkerArg* args, size_t request_num) {
-    size_t *histogram = args[0].histogram;
-    qsort(histogram, request_num, sizeof(size_t), cmp);
+    size_t *latency_arr = args[0].histogram;
+    qsort(latency_arr, request_num, sizeof(size_t), cmp);
 
-    size_t sum95 = 0, sum99 = 0, sum999 = 0;
-    size_t idx95 = request_num * 0.95, idx99 = request_num * 0.99, idx999 = request_num * 0.999;
-    // printf("idx95: %ld idx99: %ld idx999: %ld\n", idx95, idx99, idx999);
-    for (size_t i = 1; i < request_num; i++) {
-        if (histogram[i] < histogram[i-1]) {
-            printf("sort wrong! %lu: %lu %lu: %lu\n", i, histogram[i], i-1, histogram[i-1]);
-            // return;
-        }
-        // printf("%ld ", histogram[i]);
-    }
-    // printf("\n");
-
-    for (size_t i = idx95; i < request_num; i++) {
-        sum95  += histogram[i];
-        sum99  += i >= idx99  ? histogram[i] : 0;
-        sum999 += i >= idx999 ? histogram[i] : 0;
-    }
-
-    printf("95%%   latency: %f us\n", (double)sum95  / (request_num - idx95)  / 1000);
-    printf("99%%   latency: %f us\n", (double)sum99  / (request_num - idx99)  / 1000);
-    printf("99.9%% latency: %f us\n", (double)sum999 / (request_num - idx999) / 1000);
+    printf("95%%   latency: %f us\n", get_percentile(latency_arr, request_num, 0.95) / 1000);
+    printf("99%%   latency: %f us\n", get_percentile(latency_arr, request_num, 0.99) / 1000);
+    printf("99.9%% latency: %f us\n", get_percentile(latency_arr, request_num, 0.999) / 1000);
 }
 
 int run() {
     printf("Run the test of %lu requests\n", request_cnt);
     initialize(layer_cnt, RUN_MODE);
     build_cache(layer_cnt > cache_layer ? cache_layer : layer_cnt);
+
+    bpf_fd = load_bpf_program("get.o");
 
     struct timespec start, end;
     pthread_t tids[worker_num + 1];
@@ -366,45 +360,18 @@ void *print_status(void *args) {
     pthread_mutex_destroy(&mutex);
 }
 
-int get(key__t key, val__t val, WorkerArg *r) {
-    ptr__t ptr = cache_cap > 0 ? (ptr__t)(&cache[0]) : encode(0);
-    Request *req = init_request(key, r);
-
-    // printf("key %ld\n", key);
-    // print_node(0, (Node *)ptr);
-
-    if (cache_cap > 0) {
-        do {
-            ptr = next_node(key, (Node *)ptr);
-        } while (!is_file_offset(ptr));
-
-        if (cache_layer == layer_cnt) {
-            req->is_value = true;
-            ptr__t mask = BLK_SIZE - 1;
-            req->ofs = ptr & mask;
-            ptr &= (~mask);
-        }
-    }
-
-    traverse(ptr, req);
-
-    return 0;
-    // do {
-    //     read_node(ptr, node, r->db_handler, &(r->local_ring));
-    //     read_complete(&(r->local_ring), 1);
-    //     ptr = next_node(key, node);
-    // } while (node->type != LEAF);
-
-    // return retrieve_value(ptr, val, r);
-}
-
 void traverse(ptr__t ptr, Request *req) {
     struct io_uring *ring = &(req->warg->local_ring);
     struct iovec *vec = &(req->vec);
     int fd = req->warg->db_handler;
 
+    memset(req->scratch_buffer, 0, 4096);
+    struct ScatterGatherQuery *sgq = (struct ScatterGatherQuery *) req->scratch_buffer;
+    sgq->keys[0] = req->key;
+    sgq->n_keys = 1;
+
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_readv(sqe, fd, vec, 1, decode(ptr));
+    io_uring_prep_xrp_read(sqe, fd, vec, 1, decode(ptr), req->scratch_buffer, bpf_fd);
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(ring);
 }
@@ -423,11 +390,12 @@ void traverse_complete(struct io_uring *ring) {
 
     Request *req = io_uring_cqe_get_data(cqe);
     io_uring_cqe_seen(ring, cqe);
+    struct ScatterGatherQuery *sgq = (struct ScatterGatherQuery *) req->scratch_buffer;
 
     // if (req->is_value) {
         val__t val;
         Log *log = (Log *)req->vec.iov_base;
-        memcpy(val, log->val[req->ofs / VAL_SIZE], VAL_SIZE);
+        memcpy(val, sgq->values[0].value, VAL_SIZE);
         if (req->key != atoi(val)) {
             printf("Errror! key: %lu val: %s\n", req->key, val);
         }            
@@ -441,6 +409,7 @@ void traverse_complete(struct io_uring *ring) {
         req->warg->histogram[req->warg->finished] = latency;
         req->warg->finished++;
         req->warg->timer += latency;
+        free(req->scratch_buffer);
         free(log);
         free(req);
         // printf("thread %lu start %ld offset %ld end %ld latency %ld us\n", 
@@ -461,60 +430,6 @@ void traverse_complete(struct io_uring *ring) {
     //     }
     //     traverse(ptr, req);
     // }
-}
-
-void wait_for_completion(struct io_uring *ring, size_t *counter, size_t target) {
-    do {
-        traverse_complete(ring);
-    } while (*counter != target);
-}
-
-void update(key__t key, val__t val, int db_handler) {
-    ptr__t ptr = cache_cap > 0 ? (ptr__t)(&cache[0]) : encode(0);
-    Node *node;
-
-    if (posix_memalign((void **)&node, 512, sizeof(Node))) {
-        perror("posix_memalign failed");
-        exit(1);
-    }
-
-    if (cache_cap > 0) {
-        do {
-            ptr = next_node(key, (Node *)ptr);
-        } while (!is_file_offset(ptr));
-    }
-
-    do {
-        read_node(ptr, node, db_handler, NULL);
-        ptr = next_node(key, node);
-    } while (node->type != LEAF);
-
-    
-    update_value(ptr, val, db_handler);
-}
-
-void read_modify_write(key__t key, val__t val, int db_handler) {
-    ptr__t ptr = cache_cap > 0 ? (ptr__t)(&cache[0]) : encode(0);
-    Node *node;
-
-    if (posix_memalign((void **)&node, 512, sizeof(Node))) {
-        perror("posix_memalign failed");
-        exit(1);
-    }
-
-    if (cache_cap > 0) {
-        do {
-            ptr = next_node(key, (Node *)ptr);
-        } while (!is_file_offset(ptr));
-    }
-
-    do {
-        read_node(ptr, node, db_handler, NULL);
-        ptr = next_node(key, node);
-    } while (node->type != LEAF);
-
-    
-    read_modify_write_value(ptr, val, db_handler);
 }
 
 void print_node(ptr__t ptr, Node *node) {
@@ -539,12 +454,13 @@ Request *init_request(key__t key, WorkerArg *warg) {
     Request *req = (Request *)malloc(sizeof(Request));
 
     req->vec.iov_len = BLK_SIZE;
-    if (posix_memalign((void **)&(req->vec.iov_base), BLK_SIZE, BLK_SIZE)) {
+    if (posix_memalign((void **)&(req->vec.iov_base), PAGE_SIZE, PAGE_SIZE)) {
         perror("posix_memalign failed");
         exit(1);
     }
-    // let the BPF function know the key
-    memcpy(req->vec.iov_base, &key, sizeof(key));
+
+    req->scratch_buffer = (uint8_t *) aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+    BUG_ON(req->scratch_buffer == NULL);
 
     req->key = key;
     req->ofs = 0;
@@ -555,166 +471,45 @@ Request *init_request(key__t key, WorkerArg *warg) {
     return req;
 }
 
-void read_node(ptr__t ptr, Node *node, int db_handler, struct io_uring *ring) {
-    struct iovec *vec = malloc(sizeof(struct iovec));
-    vec->iov_base = node;
-    vec->iov_len = sizeof(Node);
+void pread_node(ptr__t ptr, Node *node, int db_handler) {
+    _Static_assert(sizeof(Node) == 512);
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_readv(sqe, db_handler, vec, 1, decode(ptr));
-    io_uring_sqe_set_data(sqe, vec);
-    io_uring_submit(ring);
-    
+    int ret;
+    ret = pread(db_handler, node, sizeof(Node), decode(ptr));
+    BUG_ON(ret != sizeof(Node));
+
     // Debug output
     // print_node(ptr, node);
 }
 
-void read_log(ptr__t ptr, Log *log, int db_handler, struct io_uring *ring) {
-    struct iovec *vec = malloc(sizeof(struct iovec));
-    vec->iov_base = log;
-    vec->iov_len = sizeof(Node);
+void pread_log(ptr__t ptr, Log *log, int db_handler) {
+    _Static_assert(sizeof(Log) == 512);
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_readv(sqe, db_handler, vec, 1, decode(ptr));
-    io_uring_sqe_set_data(sqe, vec);
-    io_uring_submit(ring);
+    int ret;
+    ret = pread(db_handler, log, sizeof(Log), decode(ptr));
+    BUG_ON(ret != sizeof(Log));
 
     // Debug output
     // print_log(ptr, log);
 }
 
-void read_complete(struct io_uring *ring, int is_node) {
-    struct io_uring_cqe *cqe;
-    int ret = io_uring_wait_cqe(ring, &cqe);
-    if (ret < 0) {
-        perror("io_uring_wait_cqe");
-        return;
-    }
-    if (cqe->res < 0) {
-        fprintf(stderr, "[read_complete] Error in async operation: %s\n", strerror(-cqe->res));
-        return;
-    }
+void pwrite_node(ptr__t ptr, Node *node, int db_handler) {
+    _Static_assert(sizeof(Node) == 512);
 
-    struct iovec *vec = io_uring_cqe_get_data(cqe);
-    // if (is_node) {
-    //     print_node(0, (Node *)vec->iov_base);
-    // } else {
-    //     print_log(0, (Log *)vec->iov_base);
-    // }
-    free(vec);
-    io_uring_cqe_seen(ring, cqe);
+    int ret;
+    ret = pwrite(db_handler, node, sizeof(Node), decode(ptr));
+    BUG_ON(ret != sizeof(Node));
 }
 
-void write_node(ptr__t ptr, Node *node, int db_handler, struct io_uring *ring) {
-    struct iovec *vec = malloc(sizeof(struct iovec));
-    vec->iov_base = node;
-    vec->iov_len = sizeof(Node);
+void pwrite_log(ptr__t ptr, Log *log, int db_handler) {
+    _Static_assert(sizeof(Log) == 512);
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_writev(sqe, db_handler, vec, 1, decode(ptr));
-    io_uring_sqe_set_data(sqe, vec);
-    io_uring_submit(ring);
-}
-
-void write_log(ptr__t ptr, Log *log, int db_handler, struct io_uring *ring) {
-    struct iovec *vec = malloc(sizeof(struct iovec));
-    vec->iov_base = log;
-    vec->iov_len = sizeof(Log);
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    io_uring_prep_writev(sqe, db_handler, vec, 1, decode(ptr));
-    io_uring_sqe_set_data(sqe, vec);
-    io_uring_submit(ring);
+    int ret;
+    ret = pwrite(db_handler, log, sizeof(Log), decode(ptr));
+    BUG_ON(ret != sizeof(Log));
 
     // Debug output
     // print_log(ptr, log);
-}
-
-void write_complete(struct io_uring *ring) {
-    struct io_uring_cqe *cqe;
-    int ret = io_uring_wait_cqe(ring, &cqe);
-    if (ret < 0) {
-        perror("io_uring_wait_cqe");
-        return;
-    }
-    if (cqe->res < 0) {
-        fprintf(stderr, "[write_complete] Error in async operation: %s\n", strerror(-cqe->res));
-        return;
-    }
-
-    struct iovec *vec = io_uring_cqe_get_data(cqe);
-    free(vec->iov_base);
-    free(vec);
-    io_uring_cqe_seen(ring, cqe);
-}
-
-int retrieve_value(ptr__t ptr, val__t val, WorkerArg *r) {
-    Log *log;
-    if (posix_memalign((void **)&log, 512, sizeof(Log))) {
-        perror("posix_memalign failed");
-        exit(1);
-    }
-
-    ptr__t mask = BLK_SIZE - 1;
-    ptr__t base = ptr & (~mask);
-    ptr__t offset = ptr & mask;
-
-    read_log(base, log, r->db_handler, &(r->local_ring));
-    read_complete(&(r->local_ring), 0);
-    memcpy(val, log->val[offset / VAL_SIZE], VAL_SIZE);
-    free(log);
-
-    return 0;
-}
-
-void update_value(ptr__t ptr, val__t val, int db_handler) {
-    Log *log;
-    if (posix_memalign((void **)&log, 512, sizeof(Log))) {
-        perror("posix_memalign failed");
-        exit(1);
-    }
-
-    ptr__t mask = BLK_SIZE - 1;
-    ptr__t base = ptr & (~mask);
-    ptr__t offset = ptr & mask;
-    size_t log_idx = decode(base) / BLK_SIZE - total_node;
-
-    read_log(base, log, db_handler, NULL);
-    memcpy(log->val[offset / VAL_SIZE], val, VAL_SIZE);
-
-    int rc = 0;
-    if ((rc = pthread_mutex_lock(&val_lock[log_idx])) != 0) {
-        printf("lock error %d %lu\n", rc, log_idx);
-    }
-
-    write_log(base, log, db_handler, NULL);
-
-    pthread_mutex_unlock(&val_lock[log_idx]);
-}
-
-void read_modify_write_value(ptr__t ptr, val__t val, int db_handler) {
-    Log *log;
-    if (posix_memalign((void **)&log, 512, sizeof(Log))) {
-        perror("posix_memalign failed");
-        exit(1);
-    }
-
-    ptr__t mask = BLK_SIZE - 1;
-    ptr__t base = ptr & (~mask);
-    ptr__t offset = ptr & mask;
-    size_t log_idx = decode(base) / BLK_SIZE - total_node;
-
-    int rc = 0;
-    if ((rc = pthread_mutex_lock(&val_lock[log_idx])) != 0) {
-        printf("lock error %d %lu\n", rc, log_idx);
-    }
-
-    read_log(base, log, db_handler, NULL);
-    size_t num = atoi(log->val[offset / VAL_SIZE]);
-    sprintf(log->val[offset / VAL_SIZE], "%63lu", num / 2);
-    write_log(base, log, db_handler, NULL);
-
-    pthread_mutex_unlock(&val_lock[log_idx]);
 }
 
 ptr__t next_node(key__t key, Node *node) {
@@ -725,6 +520,23 @@ ptr__t next_node(key__t key, Node *node) {
         }
     }
     return node->ptr[node->num - 1];
+}
+
+int bpf(int cmd, union bpf_attr *attr, unsigned int size) {
+    return syscall(__NR_bpf, cmd, attr, size);
+}
+
+int load_bpf_program(char *path) {
+    struct bpf_object *obj;
+    int ret, progfd;
+
+    ret = bpf_prog_load(path, BPF_PROG_TYPE_XRP, &obj, &progfd);
+    if (ret) {
+        printf("Failed to load bpf program\n");
+        exit(1);
+    }
+
+    return progfd;
 }
 
 int prompt_help() {
@@ -749,6 +561,7 @@ int main(int argc, char *argv[]) {
         rmw_ratio = atoi(argv[6]);
         cache_layer = atoi(argv[7]);
         req_per_sec = atoi(argv[8]);
+        BUG_ON(read_ratio != 100);
         return run();
     } else {
         return prompt_help();
