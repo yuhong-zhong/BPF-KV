@@ -25,6 +25,7 @@ typedef unsigned long ptr__t;
 #define KEY_SIZE sizeof(key__t)
 #define VAL_SIZE sizeof(val__t)
 #define PTR_SIZE sizeof(ptr__t)
+#define PAGE_SIZE 4096
 #define BLK_SIZE 512
 #define BLK_SIZE_LOG 9
 
@@ -166,8 +167,6 @@ void terminate_workers(pthread_t *tids, WorkerArg *args);
 int terminate();
 
 void print_node(ptr__t ptr, Node *node);
-
-int bpf(int cmd, union bpf_attr *attr, unsigned int size);
 
 int load_bpf_program(char *path);
 

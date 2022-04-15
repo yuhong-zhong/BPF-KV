@@ -522,10 +522,6 @@ ptr__t next_node(key__t key, Node *node) {
     return node->ptr[node->num - 1];
 }
 
-int bpf(int cmd, union bpf_attr *attr, unsigned int size) {
-    return syscall(__NR_bpf, cmd, attr, size);
-}
-
 int load_bpf_program(char *path) {
     struct bpf_object *obj;
     int ret, progfd;
