@@ -293,19 +293,18 @@ void *subtask(void *args) {
     srand(r->index);
     printf("thread %ld op_count %ld\n", r->index, r->op_count);
     Request **req_arr = (Request **)malloc(r->op_count * sizeof(Request *));
-    pthread_cond_t cond;
-    pthread_mutex_t mutex;
-    pthread_cond_init(&cond, NULL);
-    pthread_mutex_init(&mutex, NULL);
     struct timespec now, deadline;
     clock_gettime(CLOCK_REALTIME, &now);
     size_t gap = 1000000000 / req_per_sec;
     deadline = now;
+    size_t num_submitted_sum = 0;
+    size_t num_submitted_count = 0;
 
     while (r->issued < r->op_count) {
         // Submit a batch of requests
         size_t num_req_submitted = 0;
-        while (!early_than(&now, &deadline) && (r->issued < r->op_count) && (r->issued - r->finished < QUEUE_DEPTH)) {
+        while ((r->issued < r->op_count) && (r->issued - r->finished < QUEUE_DEPTH))
+        {
             // Running late. Submit one request.
             key__t key = rand() % max_key;
             val__t val;
@@ -314,16 +313,17 @@ void *subtask(void *args) {
             traverse(encode(0), req_arr[r->issued++]);
             ++num_req_submitted;
 
-            // Update timer
-            clock_gettime(CLOCK_REALTIME, &now);
+            // Update deadline
             add_nano_to_timespec(&deadline, gap);
         }
         if (num_req_submitted > 0) {
-            int ret;
-            ret = io_uring_enter(r->local_ring.ring_fd, num_req_submitted, 0, IORING_ENTER_GETEVENTS);
+            write_barrier();
+            int ret = io_uring_enter(r->local_ring.ring_fd, num_req_submitted, 0, IORING_ENTER_GETEVENTS);
             BUG_ON(ret != num_req_submitted);
+            num_submitted_sum += num_req_submitted;
+            num_submitted_count++;
         }
-        while (r->issued - r->finished >= QUEUE_DEPTH / 2) {
+        while (r->issued - r->finished >= QUEUE_DEPTH - MIN_BATCH_SIZE) {
             traverse_complete(&r->local_ring);
         }
 
@@ -335,18 +335,19 @@ void *subtask(void *args) {
 
         clock_gettime(CLOCK_REALTIME, &now);
         if (early_than(&now, &deadline)) {
-            pthread_mutex_lock(&mutex);
-            pthread_cond_timedwait(&cond, &mutex, &deadline);
-            pthread_mutex_unlock(&mutex);
+            size_t diff = get_nano(deadline) - get_nano(now);
+            struct timespec ts;
+            ts.tv_sec = diff / 1000000000;
+            ts.tv_nsec = diff % 1000000000;
+            nanosleep(&ts, NULL);
         }
     }
     while (r->finished < r->op_count) {
         traverse_complete(&r->local_ring);
     }
-    pthread_cond_destroy(&cond);
-    pthread_mutex_destroy(&mutex);
     free(req_arr);
-    printf("thread %lu finishes %lu\n", r->index, r->finished);
+    printf("thread %lu finishes %lu avg submitted per syscall %f\n",
+           r->index, r->finished, (double) num_submitted_sum / (double) num_submitted_count);
 }
 
 void *print_status(void *args) {
@@ -425,13 +426,16 @@ void traverse(ptr__t ptr, Request *req) {
     struct iovec *vec = &(req->vec);
     int fd = req->warg->db_handler;
  
-    memset(req->scratch_buffer, 0, 4096);
     struct ScatterGatherQuery *sgq = (struct ScatterGatherQuery *) req->scratch_buffer;
-    sgq->keys[0] = req->key;
+    sgq->root_pointer = 0;
+    sgq->value_ptr = 0;
+    sgq->state_flags = 0;
+    sgq->current_index = 0;
     sgq->n_keys = 1;
+    sgq->keys[0] = req->key;
 
     submit_to_sq(s, (unsigned long long) req, vec, decode(ptr),
-                 req->scratch_buffer, bpf_fd, true);
+                 req->scratch_buffer, bpf_fd, false);
 }
 
 void traverse_complete(struct submitter *s) {
